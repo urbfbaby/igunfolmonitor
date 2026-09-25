@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Sensitif & Rahasia Akun
+.env
+sessions/
+*.session
+
+# Database lokal
+*.db
+*.sqlite3
+
+# Log & OS
+*.log
+logs/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
