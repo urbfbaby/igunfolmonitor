@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import pickle
 import argparse
 from datetime import datetime
 from dotenv import load_dotenv
@@ -12,7 +13,6 @@ if sys.stdout.encoding != 'utf-8':
         sys.stderr.reconfigure(encoding='utf-8')
     except Exception:
         pass
-
 
 import instaloader
 from database import init_db, process_follower_update, get_current_stored_followers
@@ -47,54 +47,101 @@ def get_loader() -> instaloader.Instaloader:
         print("[Error] IG_USERNAME belum diatur di file .env!")
         sys.exit(1)
 
-    # Cek apakah session file sudah ada
     if os.path.exists(SESSION_FILE):
         try:
             print(f"[Info] Memuat session Instagram dari {SESSION_FILE}...")
             L.load_session_from_file(IG_USERNAME, filename=SESSION_FILE)
-            print("[Info] Berhasil login menggunakan session file.")
+            print("[Info] Berhasil memuat session.")
             return L
         except Exception as e:
-            print(f"[Warning] Gagal memuat session file ({e}). Perlu login ulang.")
+            print(f"[Warning] Gagal memuat session file ({e}).")
 
-    # Jika session file belum ada, minta login interaktif
-    print(f"\n--- LOGIN INSTAGRAM DIPERLUKAN UNTUK @{IG_USERNAME} ---")
-    print("Sesi login akan disimpan secara lokal sehingga tidak perlu login berulang kali.")
-    try:
-        L.interactive_login(IG_USERNAME)
-        L.save_session_to_file(filename=SESSION_FILE)
-        print(f"[Info] Session berhasil disimpan ke {SESSION_FILE}")
-        return L
-    except Exception as e:
-        print(f"[Error] Gagal login Instagram: {e}")
-        sys.exit(1)
+    print("\n[Error] File session tidak ditemukan atau belum valid!")
+    print("Harap jalankan terlebih dahulu: python login_cookie.py")
+    sys.exit(1)
+
+def get_account_user_id(L: instaloader.Instaloader) -> str:
+    """Retrieves account user_id from session cookies or session file."""
+    # Cek dari cookies session
+    uid = L.context._session.cookies.get("ds_user_id")
+    if uid:
+        return str(uid)
+    
+    # Cek dari file session pickle
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, "rb") as f:
+                data = pickle.load(f)
+                if isinstance(data, dict) and data.get("ds_user_id"):
+                    return str(data["ds_user_id"])
+        except Exception:
+            pass
+
+    return ""
 
 def fetch_current_followers(L: instaloader.Instaloader, target: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Mengambil data followers untuk @{target}...")
+    """
+    Fetches followers using Instagram's official Web API endpoint (api/v1/friendships/{id}/followers).
+    This endpoint completely bypasses the HTTP 429 error caused by web_profile_info.
+    """
+    user_id = get_account_user_id(L)
+    if not user_id:
+        print("[Error] User ID akun tidak ditemukan di cookie session. Jalankan ulang python login_cookie.py.")
+        return None
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Mengambil data followers untuk @{target} (User ID: {user_id})...")
+    
+    headers = {
+        "x-ig-app-id": "936619743392459",
+        "Referer": f"https://www.instagram.com/{target}/",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+
+    followers_dict = {}
+    next_max_id = ""
+    page = 1
+
     try:
-        profile = instaloader.Profile.from_username(L.context, target)
-        followers_dict = {}
+        while True:
+            url = f"https://www.instagram.com/api/v1/friendships/{user_id}/followers/?count=50"
+            if next_max_id:
+                url += f"&max_id={next_max_id}"
 
-        # Loop followers
-        count = 0
-        for follower in profile.get_followers():
-            count += 1
-            followers_dict[follower.userid] = {
-                "username": follower.username,
-                "full_name": follower.full_name or ""
-            }
-            if count % 100 == 0:
-                print(f"   Sudah memuat {count} followers...")
+            resp = L.context._session.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                print(f"[Error] Gagal request followers (HTTP {resp.status_code}): {resp.text[:150]}")
+                break
 
-        print(f"[Info] Total {len(followers_dict)} followers berhasil diambil.")
+            data = resp.json()
+            users = data.get("users", [])
+            for u in users:
+                uid = int(u.get("pk"))
+                followers_dict[uid] = {
+                    "username": u.get("username", ""),
+                    "full_name": u.get("full_name", "")
+                }
+
+            print(f"   [Halaman {page}] Terkumpul {len(followers_dict)} followers...")
+
+            next_max_id = data.get("next_max_id")
+            if not next_max_id or not data.get("has_more", False):
+                break
+
+            page += 1
+            # Jeda sopan agar tidak dicurigai server Instagram
+            time.sleep(1.2)
+
+        print(f"[Info] Sukses! Total {len(followers_dict)} followers berhasil dimuat.")
         return followers_dict
+
     except Exception as e:
-        print(f"[Error] Gagal mengambil followers: {e}")
+        print(f"[Error] Terjadi kesalahan saat mengambil followers: {e}")
         return None
 
 def run_monitoring_cycle(L: instaloader.Instaloader, notifier: TelegramNotifier, target: str):
     current_followers = fetch_current_followers(L, target)
-    if current_followers is None:
+    if current_followers is None or len(current_followers) == 0:
+        print("[Warning] Data followers kosong atau gagal diambil.")
         return
 
     unfollowers, new_followers, renamed, is_first_run = process_follower_update(
@@ -105,8 +152,11 @@ def run_monitoring_cycle(L: instaloader.Instaloader, notifier: TelegramNotifier,
     if is_first_run:
         msg = (
             f"✅ <b>Database Berhasil Diinisialisasi!</b>\n"
-            f"Berhasil menyimpan <b>{len(current_followers)}</b> followers awal.\n"
-            f"Monitoring unfollow untuk @{target} sekarang aktif!"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Akun:</b> @{target}\n"
+            f"👥 <b>Total Followers:</b> {len(current_followers)}\n"
+            f"🛡️ <b>Status:</b> Monitoring Unfollow Aktif!\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
         print(f"[Info] Snapshot awal tersimpan ({len(current_followers)} followers).")
         notifier.send_message(msg)
