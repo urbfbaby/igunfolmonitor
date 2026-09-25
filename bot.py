@@ -5,6 +5,15 @@ import argparse
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Ensure UTF-8 output on Windows console
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+
 import instaloader
 from database import init_db, process_follower_update, get_current_stored_followers
 from telegram_notifier import TelegramNotifier
